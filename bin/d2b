@@ -1,0 +1,437 @@
+#! /usr/bin/env ruby
+
+require 'pathname'
+require 'digest/md5'
+
+require 'main'
+require 'aws-sdk'
+require 'mime/types'
+require 'threadify'
+require 'pry'
+require 'map'
+require 'mime/types'
+require 'zlib'
+
+
+Main {
+
+  name 'd2b'
+
+  description <<-__ 
+
+    d2b syncs directories with an s3 bucket very, very quickly
+
+  __
+
+  examples <<-__
+  __
+
+  config <<-__
+    aws:
+      access_key_id: your_own_access_key_id 
+      secret_access_key: your_own_secret_access_key 
+  __
+
+#
+  option('access_key_id', 'a'){
+    argument(:required)
+  }
+
+  option('secret_access_key', 's'){
+    argument(:required)
+  }
+
+  option('bucket', 'b'){
+    argument(:required)
+  }
+
+  option('endpoint', 'e'){
+    argument(:required)
+    default('s3.amazonaws.com')
+  }
+
+  option('force', 'F'){
+    cast(:bool)
+  }
+
+#
+  mode(:config){
+    def run
+      y aws_settings
+    end
+  }
+
+  mode(:shell){
+    def run
+      setup!
+      binding.pry(:hooks => Pry::Hooks.new, :prompt => proc{|*a| "d2b ~> "})
+    end
+  }
+
+#
+  mode(:bucket){
+    mode(:create){
+      argument :bucket
+
+      def run
+        setup!
+        s3.buckets.create(bucket_name)
+        puts(bucket_name)
+      end
+    }
+
+    mode(:destroy){
+      argument :bucket
+
+      def run
+        setup!
+        s3.buckets[bucket_name].delete
+        puts(bucket_name)
+      end
+    }
+
+    mode(:list){
+      def run
+        setup!
+        s3.buckets.each do |bucket|
+          puts(bucket.name)
+        end
+      end
+    }
+  }
+
+#
+  mode(:sync){
+    argument :directory
+    argument :bucket
+
+    option('gzip', 'g'){
+    }
+    option('acl'){
+      default 'public_read'
+    }
+
+    def run
+    #
+      directory = File.expand_path(params[:directory].value)
+      abort "no directory #{ directory }" unless test(?d, directory)
+
+      paths = Dir.glob("#{ directory }/**/**")
+
+      bucket.objects['force-some-autoloading-to-hack-around-thread-safety']
+
+      gzip = params['gzip'].given?
+      force = params['force'].given?
+      acl = params['acl'].value
+
+    #
+      keys =
+        paths.threadify(16) do |path|
+          next unless test(?f, path)
+          key  = relative_path(path, :from => directory)
+
+          retrying do
+            data = IO.binread(path)
+            md5  = md5_for(data)
+
+            object = bucket.objects[key]
+
+            url = object.url_for(:read).to_s.split('?').first
+
+            metadata = object.metadata
+
+            if metadata['md5'] != md5 or force
+              content_type = extract_content_type(path)
+
+              options = {
+                :acl          => acl,
+                :content_type => content_type,
+                :metadata     => { :md5 => md5 }
+              }
+
+              if gzip
+                data = gzip!(data, :path => path)
+                options[:content_encoding] = "gzip"
+              end
+
+              object.write(data, options)
+
+              Say.say("UPDATED: #{ url }", :color => :green)
+            else
+              Say.say("SKIPPED: #{ url }", :color => :blue)
+            end
+          end
+
+          key
+        end
+
+    #
+      index = {}
+      keys.each{|key| index[key] = key}
+
+      bucket.objects.each do |object|
+        unless index.has_key?(object.key)
+          object.delete
+          url = object.url_for(:read).to_s.split('?').first
+          Say.say("DELETED: #{ url }", :color => :red)
+        end
+      end
+    end
+  }
+
+#
+  mode(:url){
+    argument(:bucket)
+    argument(:key)
+
+    def run
+      key = params[:key].value
+
+      object = bucket.objects[key]
+
+      puts object.url_for(:read)
+    end
+  }
+
+#
+  def paths_for(*args)
+    path = args.flatten.compact.join('/')
+    path.gsub!(%r|[.]+/|, '/')
+    path.squeeze!('/')
+    path.sub!(%r|^/|, '')
+    path.sub!(%r|/$|, '')
+    paths = path.split('/')
+  end
+
+  def absolute_path(*args)
+    path = ('/' + paths_for(*args).join('/')).squeeze('/')
+    path unless path.blank?
+  end
+
+  def normalize_path(arg, *args)
+    absolute_path_for(arg, *args)
+  end
+
+  def relative_path(path, *args)
+    options = Map.options_for!(args)
+
+    relative = args.shift || options[:relative] || options[:to] || options[:from]
+
+    if relative
+      relative = String(relative)
+      path = File.expand_path(String(path))
+      Pathname.new(path).relative_path_from(Pathname.new(relative)).to_s
+    else
+      path = absolute_path_for(*args).sub(%r{^/+}, '')
+      path unless path.blank?
+    end
+  end
+
+#
+  def s3
+    AWS::S3.new(:s3_endpoint => params[:endpoint].value)
+  end
+
+  def bucket
+    s3.buckets[bucket_name]
+  end
+
+  def bucket_name
+    bucket_name =
+      if params[:bucket].given?
+        params[:bucket].value
+      else
+        aws_settings[:bucket]
+      end
+
+    if bucket_name.to_s.strip.empty?
+      abort "no bucket_name"
+    end
+
+    bucket_name
+  end
+
+  def setup!
+    STDOUT.sync = true
+    STDERR.sync = true
+    AWS.eager_autoload! AWS::S3
+    AWS.config(aws_settings)
+  end
+
+  def aws_settings
+    @aws_settings = (
+      h =
+        case 
+          when config.has_key?('aws')
+            config['aws']
+          else
+            config
+        end
+
+      h = Hash.new unless h.is_a?(Hash)
+
+      access_key_id = nil
+      if params['access_key_id'].given?
+        h['access_key_id'] = params['access_key_id'].value
+      end
+      if h['access_key_id'].to_s.strip.empty?
+        %w( ACCESS_KEY_ID AMAZON_ACCESS_KEY_ID ).each do |key|
+          val = ENV[key]
+          unless val.to_s.strip.empty?
+            #h['access_key_id'] = val
+          end
+        end
+      end
+
+      secret_access_key = nil
+      if params['secret_access_key'].given?
+        h['secret_access_key'] = params['secret_access_key'].value
+      end
+      if h['secret_access_key'].to_s.strip.empty?
+        %w( SECRET_ACCESS_KEY AMAZON_SECRET_ACCESS_KEY ).each do |key|
+          val = ENV[key]
+          unless val.to_s.strip.empty?
+            #h['secret_access_key'] = val
+          end
+        end
+      end
+
+      h
+    )
+  end
+
+#
+  def y(object, options = {})
+    io = options[:io] || STDOUT
+    indent = (options[:indent] || 0).to_i
+
+    yml = object.to_yaml.gsub(/\s*\!omap\s*$/, "").gsub(/^---$\s*/, "")
+
+    if indent > 0
+      yml.gsub!(/^/, (' ' * indent))
+    end
+
+    io << yml
+  end
+
+  def extract_content_type(filename, options = {})
+    options = Map.for(options)
+
+    basename = ::File.basename(filename.to_s)
+    parts = basename.split('.')
+    parts.shift
+    ext = parts.pop
+
+    default =
+      case
+        when options[:default]==false
+          nil
+        when options[:default]==true
+          "application/octet-stream"
+        else
+          (options[:default] || "application/octet-stream").to_s
+      end
+
+    content_type = mime_types[ext] || MIME::Types.type_for(::File.basename(filename.to_s)).first
+
+    if content_type
+      content_type.to_s
+    else
+      default
+    end
+  end
+
+  def mime_types
+    {
+      'md' => 'text/x-markdown; charset=UTF-8'
+    }
+  end
+
+  def md5_for(data)
+    Digest::MD5.hexdigest(data)
+  end
+
+  def gzip!(data, options = {})
+    path = options[:path] || options['path']
+
+    gz = Zlib::GzipWriter.new(sio = StringIO.new)
+
+    if path
+      gz.mtime = File.mtime(path)
+      gz.orig_name = File.basename(path)
+    end
+
+    gz.write(data)
+    gz.close
+
+    sio.string
+  end
+
+  def retrying(*args, &block)
+    options = Map.options_for!(args)
+    n = options[:n] ||= 4
+    i = 0
+
+    begin
+      block.call
+    rescue Object => e
+      i += 1
+      raise if i >= n
+      sleep(rand)
+      retry
+    end
+  end
+
+  module Say
+    def say(phrase, *args)
+      ansi = {
+        :clear      => "\e[0m",
+        :reset      => "\e[0m",
+        :erase_line => "\e[K",
+        :erase_char => "\e[P",
+        :bold       => "\e[1m",
+        :dark       => "\e[2m",
+        :underline  => "\e[4m",
+        :underscore => "\e[4m",
+        :blink      => "\e[5m",
+        :reverse    => "\e[7m",
+        :concealed  => "\e[8m",
+        :black      => "\e[30m",
+        :red        => "\e[31m",
+        :green      => "\e[32m",
+        :yellow     => "\e[33m",
+        :blue       => "\e[34m",
+        :magenta    => "\e[35m",
+        :cyan       => "\e[36m",
+        :white      => "\e[37m",
+        :on_black   => "\e[40m",
+        :on_red     => "\e[41m",
+        :on_green   => "\e[42m",
+        :on_yellow  => "\e[43m",
+        :on_blue    => "\e[44m",
+        :on_magenta => "\e[45m",
+        :on_cyan    => "\e[46m",
+        :on_white   => "\e[47m"
+      }
+
+      options = args.last.is_a?(Hash) ? args.pop : {}
+      options[:color] = args.shift.to_s.to_sym unless args.empty?
+      keys = options.keys
+      keys.each{|key| options[key.to_s.to_sym] = options.delete(key)}
+
+      color = options[:color]
+      bold = options.has_key?(:bold)
+
+      parts = [phrase]
+      parts.unshift(ansi[color]) if color
+      parts.unshift(ansi[:bold]) if bold
+      parts.push(ansi[:clear]) if parts.size > 1
+
+      method = options[:method] || :puts
+
+      Kernel.send(method, parts.join)
+    end
+
+    extend(Say)
+  end
+}
